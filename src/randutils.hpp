@@ -244,7 +244,7 @@ private:
         return result;
     }
 
-    std::array<IntRep, count> mixer_;
+    std::array<IntRep, count> mixer_ = {};
 
     template <typename InputIter>
     void mix_entropy(InputIter begin, InputIter end);
@@ -447,7 +447,7 @@ class auto_seeded : public SeedSeq {
 
     static constexpr uint32_t fnv(uint32_t hash, const char* pos)
     {
-        return *pos == '\0' ? hash : fnv((hash * 16777619U) ^ *pos, pos+1);
+        return *pos == '\0' ? hash : fnv((hash * 16777619U) ^ static_cast<uint32_t>(*pos), pos+1);
     }
 
     default_seeds local_entropy()
@@ -463,9 +463,9 @@ class auto_seeded : public SeedSeq {
 
         // The heap can vary from run to run as well.
         void* malloc_addr = malloc(sizeof(int));
-        free(malloc_addr);
         auto heap  = hash(malloc_addr);
         auto stack = hash(&malloc_addr);
+        free(malloc_addr);
 
         // Every call, we increment our random int.  We don't care about race
         // conditons.  The more, the merrier.
