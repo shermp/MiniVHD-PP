@@ -123,8 +123,8 @@ static inline void h_to_be(T& val)
 	const auto size = sizeof(T);
 	static_assert(size == 8 || size == 4 || size == 2 || size == 1,
 	              "val must be valid integral");
-	T temp   = 0;
-	auto tmp = reinterpret_cast<unsigned char*>(&temp);
+	T temp    = 0;
+	auto tmp  = reinterpret_cast<unsigned char*>(&temp);
 	int index = 0;
 	switch (size) {
 	case 8:
@@ -255,7 +255,7 @@ static std::error_code write_sector_padding(std::filebuf& file, const uint32_t c
 	return ec;
 }
 
-/* Reads a structure from file into a struct/class 
+/* Reads a structure from file into a struct/class
    The struct or class must NOT have padding */
 template <typename S>
 static std::error_code read_structure(S& structure, std::filebuf& file,
@@ -267,7 +267,7 @@ static std::error_code read_structure(S& structure, std::filebuf& file,
 	return read_bytes(b, size, file, offset, dir);
 }
 
-/* Writes a structure to file from a struct/class 
+/* Writes a structure to file from a struct/class
    The struct or class must NOT have padding */
 template <typename S>
 static std::error_code write_structure(
@@ -659,7 +659,7 @@ std::error_code VHD::bat_create_block(uint32_t block_num)
 	return ec;
 }
 
-/* A sparse block is not allocated, and therefore the sectors 
+/* A sparse block is not allocated, and therefore the sectors
    it contains are zero sectors */
 bool VHD::bat_block_is_sparse(uint32_t block_num)
 {
@@ -674,7 +674,7 @@ bool VHD::bat_block_is_sparse(uint32_t block_num)
    sector reads. Sectors are cached in 4KiB chunks. Only reads
    populate the cache. Writes will update the cache if an entry
    exists.
-   
+
    There is also a LRU cache to manage the sector bitmaps. This
    cache is populated on both reads and writes */
 
@@ -920,7 +920,8 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 			if ((ec = read_bytes(path_buff.data(),
 			                     path_buff.size() * sizeof(char16_t),
 			                     f,
-			                     static_cast<std::streamoff>(loc.plat_data_offset)))) {
+			                     static_cast<std::streamoff>(
+			                             loc.plat_data_offset)))) {
 				throw std::system_error(ec);
 			}
 			/* TODO: Handle path endianess */
@@ -1109,7 +1110,9 @@ VHD::VHD(fs::path const& vhd_path, VHDType const vhd_type, Geom const& geom,
 	if ((ec = write_structure(tmp_footer, f, 0))) {
 		throw std::system_error(ec);
 	}
-	if ((ec = write_structure(tmp_header, f, static_cast<std::streamoff>(footer.data_offset)))) {
+	if ((ec = write_structure(tmp_header,
+	                          f,
+	                          static_cast<std::streamoff>(footer.data_offset)))) {
 		throw std::system_error(ec);
 	}
 
@@ -1118,7 +1121,8 @@ VHD::VHD(fs::path const& vhd_path, VHDType const vhd_type, Geom const& geom,
 	}
 	if ((ec = write_sector_padding(f,
 	                               bat_loc_padding,
-	                               static_cast<std::streamoff>(header.bat_offset + bat_size_bytes())))) {
+	                               static_cast<std::streamoff>(
+	                                       header.bat_offset + bat_size_bytes())))) {
 		throw std::system_error(ec);
 	}
 
@@ -1132,7 +1136,8 @@ VHD::VHD(fs::path const& vhd_path, VHDType const vhd_type, Geom const& geom,
 		if ((ec = write_bytes(par_loc_buff.data(),
 		                      par_loc_buff.size() * sizeof(char16_t),
 		                      f,
-		                      static_cast<std::streamoff>(header.par_loc_entries[0].plat_data_offset)))) {
+		                      static_cast<std::streamoff>(
+		                              header.par_loc_entries[0].plat_data_offset)))) {
 			throw std::system_error(ec);
 		}
 	}
@@ -1183,8 +1188,8 @@ VHD::open_variant VHD::create_fixed(fs::path const& vhd_path, Geom const& geom)
 }
 
 /* Create a sparse VHD at vhd_path with geometry geom. If block_size
-   is BlockSize::Large (default) then the image will be created with 
-   2MiB block sizes. Otherwise if BlockSize::Small, the blocks will 
+   is BlockSize::Large (default) then the image will be created with
+   2MiB block sizes. Otherwise if BlockSize::Small, the blocks will
    512KiB in size */
 VHD::open_variant VHD::create_sparse(fs::path const& vhd_path, Geom const& geom,
                                      BlockSize block_size)
@@ -1192,9 +1197,9 @@ VHD::open_variant VHD::create_sparse(fs::path const& vhd_path, Geom const& geom,
 	return create(vhd_path, geom, block_size, fs::path(), VHDType::Sparse);
 }
 
-/* Create a sparse VHD at vhd_path, which has a parent at par_path. 
-   If block_size is BlockSize::Large (default) then the image will 
-   be created with 2MiB block sizes. Otherwise if BlockSize::Small, 
+/* Create a sparse VHD at vhd_path, which has a parent at par_path.
+   If block_size is BlockSize::Large (default) then the image will
+   be created with 2MiB block sizes. Otherwise if BlockSize::Small,
    the blocks will 512KiB in size.  */
 VHD::open_variant VHD::create_diff(fs::path const& vhd_path,
                                    fs::path const& par_path, BlockSize block_size)
@@ -1221,7 +1226,7 @@ VHD::open_variant VHD::create(fs::path const& vhd_path, Geom const& geom,
 	}
 }
 
-/* Read a single sector at sector_num offset from the VHD 
+/* Read a single sector at sector_num offset from the VHD
    and store the data in the buffer pointed to by dest.
    The buffer MUST be large enough to hold the size of
    a sector. */
@@ -1270,7 +1275,7 @@ std::error_code VHD::read_sector(uint32_t const sector_num, void* dest)
 	return ec;
 }
 
-/* Write a single sector at sector_num offset to the VHD 
+/* Write a single sector at sector_num offset to the VHD
    from the data in the buffer pointed to by src.
    The buffer MUST be large enough to hold the size of
    a sector. */
