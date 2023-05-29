@@ -86,6 +86,7 @@ struct VHDErrCat : std::error_category {
 		case ErrorCode::UnsupportedBlockSize:
 			return "unsupported block size";
 		case ErrorCode::SectorOutOfRange: return "sector out of range";
+		case ErrorCode::ReadOnly: return "write to read only image forbidden";
 		default: return "unkown error";
 		}
 	}
@@ -787,6 +788,7 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
         : f(),
           footer{},
           header{},
+		  ro(read_only),
           bat{},
           sector_cache(lru_cache_limit),
           sb_cache(sb_cache_limit)
@@ -1292,6 +1294,9 @@ std::error_code VHD::write_sector(uint32_t const sector_num, const void* src)
 {
 	if (sector_num >= footer.geom.num_sectors()) {
 		return make_ec(ErrorCode::SectorOutOfRange);
+	}
+	if (ro) {
+		return make_ec(ErrorCode::ReadOnly);
 	}
 	std::error_code ec;
 	if (footer.disk_type == VHDType::Fixed) {

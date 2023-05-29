@@ -46,6 +46,7 @@ enum class ErrorCode {
 	NoParent,
 	UnsupportedBlockSize,
 	SectorOutOfRange,
+	ReadOnly,
 };
 
 enum class BlockSize { Large, Small };
@@ -227,6 +228,7 @@ private:
 	static_assert(sizeof(SparseHeader) == sparse_size);
 
 	std::filebuf f;
+	bool ro;
 
 	Footer footer;
 	SparseHeader header;
