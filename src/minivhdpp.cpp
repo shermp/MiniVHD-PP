@@ -1,12 +1,13 @@
 #include "minivhdpp.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <random>
 #include <string>
 #include <string_view>
-
-#include "randutils.hpp"
 
 namespace MVHDPP {
 
@@ -54,9 +55,6 @@ constexpr auto rw_mode = std::ios_base::in | std::ios_base::out |
 constexpr auto ro_mode = std::ios_base::in | std::ios_base::binary;
 
 constexpr std::array<uint8_t, sector_size> zero_data = {0};
-
-/* Setup a random number generator for UUID creation */
-randutils::mt19937_rng rng;
 
 /******************************************
  * Error Codes
@@ -349,9 +347,20 @@ uint64_t Geom::size_bytes() const
 
 void VHD::Uuid::generate_v4()
 {
+	uint64_t seed = 0;
+	seed = std::random_device {}();
+	uint64_t seed2 = std::random_device {}();
+	/* There is no guarantee that random_device is truly random
+	   Eg: some versions of MinGW have a hardcoded value */
+	if (seed == seed2) {
+		seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+	}
+	std::mt19937_64 mt(seed);
+	std::uniform_int_distribution<> dist(0u, 255u);
+	
 	/* Generate a v4 (random) UUID */
 	for (auto& b : uuid) {
-		b = rng.uniform(static_cast<uint8_t>(0), static_cast<uint8_t>(255));
+		b = static_cast<uint8_t>(dist(mt));
 	}
 	clear_bit<6>(uuid[8]);
 	set_bit<7>(uuid[8]);
