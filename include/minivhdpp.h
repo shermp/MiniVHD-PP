@@ -22,14 +22,6 @@ constexpr int sparse_size = 1024L;
 
 constexpr int sector_size = 512;
 
-/* I/O Cache constants */
-constexpr int lru_chunk_size    = 4096;
-constexpr int sector_chunk_size = 4096;
-
-constexpr size_t cache_limits_bytes = 512 * 1024;
-constexpr size_t lru_cache_limit    = cache_limits_bytes / sector_chunk_size;
-constexpr size_t sb_cache_limit     = cache_limits_bytes / 512;
-
 enum class ErrorCode {
 	NotVHD = 10,
 	NotFile,
@@ -51,59 +43,66 @@ enum class ErrorCode {
 
 enum class BlockSize { Large, Small };
 
-template <typename K, typename V>
 class LRUCache {
 public:
+	LRUCache(std::size_t size);
 
-	LRUCache(std::size_t size) : cache_size(size), cache_list {}, cache_map {} {}
-	bool in_cache(const K key)
-	{
-		return cache_map.find(key) != cache_map.end();
-	}
-
-	V& get(const K key)
-	{
-		auto it = cache_map[key];
-		move_to_front(it);
-		return (*it).second;
-	}
-
-	void set(const K key, V const& val)
-	{
-		if (in_cache(key)) {
-			move_to_front(cache_map[key]);
-			V& front = cache_list.front().second;
-			front    = val;
-			return;
-		}
-		if (cache_map.size() < cache_size) {
-			cache_list.emplace_front(std::pair<K, V> {key, V(val)});
-			cache_map.emplace(key, cache_list.begin());
-		} else {
-			auto last = --cache_list.end();
-			move_to_front(last);
-			cache_map.erase(cache_list.front().first);
-			cache_list.front().first  = key;
-			cache_list.front().second = val;
-			cache_map.try_emplace(key, cache_list.begin());
-		}
-	}
-
-	void clear()
-	{
-		cache_map.clear();
-		cache_list.clear();
-	}
+	bool in_cache(const uint64_t key);
+	uint8_t* get(const uint64_t key);
+	void set(const uint64_t key, const void* val);
+	void clear();
 
 private:
-	std::size_t cache_size;
-	std::list<std::pair<K, V>> cache_list;
-	std::unordered_map<K, typename std::list<std::pair<K, V>>::iterator> cache_map;
+	struct Node {
+		uint64_t key;
+		uint8_t* val;
+	};
+	std::list<Node> cache_list;
+	std::unordered_map<uint64_t, typename std::list<Node>::iterator> cache_map;
+	std::vector<uint8_t> backing_store;
+	std::size_t cache_size = 0;
 
-	void move_to_front(typename std::list<std::pair<K, V>>::iterator it)
-	{
-		cache_list.splice(cache_list.begin(), cache_list, it);
-	}
+	void move_to_front(typename std::list<Node>::iterator it);
+};
+
+class IOManager {
+public:
+	using ios = std::ios_base;
+	IOManager(std::size_t cache_size);
+
+	std::error_code open_file(fs::path path, ios::openmode open_mode);
+	std::error_code create_file(fs::path path, uintmax_t size = 0);
+
+	std::filebuf& file();
+
+	std::error_code read_chunk(void* dest, uint64_t chunk, std::streamoff offset);
+	std::error_code write_chunk(const void* src, uint64_t chunk,
+	                            std::streamoff offset);
+	std::error_code read_bytes(void* dest, uint64_t num_bytes,
+	                           std::streamoff offset,
+	                           ios::seekdir dir = ios::beg);
+	std::error_code write_bytes(const void* src, uint64_t num_bytes,
+	                            std::streamoff offset,
+	                            ios::seekdir dir = ios::beg);
+	template <typename Structure>
+	std::error_code read_structure(Structure& s, std::streamoff offset,
+	                               ios::seekdir dir = ios::beg);
+	template <typename Structure>
+	std::error_code write_structure(Structure const& s, std::streamoff offset,
+	                                ios::seekdir dir = ios::beg);
+	std::streamoff offset_at(std::streamoff rel_offset,
+	                         ios::seekdir dir = ios::beg);
+	int flush();
+	void next_write_preserve_cache();
+
+private:
+	enum class PrevState { Read, Write, Unknown };
+	std::filebuf img;
+	LRUCache chunk_cache;
+
+	std::streamoff curr_offset = 0;
+	PrevState prev_state       = PrevState::Unknown;
+	bool preserve_cache        = false;
 };
 
 struct Geom {
@@ -227,13 +226,12 @@ private:
 	};
 	static_assert(sizeof(SparseHeader) == sparse_size);
 
-	std::filebuf f;
 	bool ro;
 
 	Footer footer;
 	SparseHeader header;
 
-	int sectors_per_block  = 0;
+	int sectors_per_block = 0;
 
 	std::unique_ptr<VHD> parent = nullptr;
 
@@ -257,21 +255,16 @@ private:
 	bool sparse_header_populated();
 
 	/* File I/O */
-	LRUCache<uint32_t, std::array<uint8_t, sector_chunk_size>> sector_cache;
-	LRUCache<uint32_t, std::array<uint8_t, sector_size>> sb_cache;
+	IOManager io;
 
-	bool sector_in_cache(uint32_t sector_num);
-	void read_sector_from_cache(uint32_t sector_num, void* dest);
-	void write_sector_to_cache(uint32_t sector_num, const void* src);
+	std::error_code write_sector_padding(const uint32_t count,
+	                                     const std::streamoff offset);
 
-	bool sb_in_cache(uint32_t block_num);
-	bool sb_test(uint32_t block_num, uint32_t sib);
-	void sb_set(uint32_t block_num, uint32_t sib);
-
-	std::error_code sb_read_from_file(uint32_t block_num);
-	std::error_code sb_write_to_file(uint32_t block_num);
-
-	void clear_caches();
+	std::array<uint8_t, sector_size> curr_sb = {0};
+	std::error_code sb_get(uint32_t block_num);
+	std::error_code sb_save(uint32_t block_num);
+	bool sb_test(uint32_t sib);
+	void sb_set(uint32_t sib);
 };
 
 } // namespace MVHDPP

@@ -47,6 +47,9 @@ constexpr std::streamoff footer_offset = footer_size * -1;
 /* Error returned by filebuf::pubseekoff */
 static const std::filebuf::pos_type pos_err(-1);
 
+/* Cache size */
+constexpr std::size_t cache_size = (1024 * 1024) / sector_size;
+
 /* File modes */
 constexpr auto create_mode = std::ios_base::out | std::ios_base::trunc |
                              std::ios_base::binary;
@@ -86,7 +89,8 @@ struct VHDErrCat : std::error_category {
 		case ErrorCode::UnsupportedBlockSize:
 			return "unsupported block size";
 		case ErrorCode::SectorOutOfRange: return "sector out of range";
-		case ErrorCode::ReadOnly: return "write to read only image forbidden";
+		case ErrorCode::ReadOnly:
+			return "write to read only image forbidden";
 		default: return "unkown error";
 		}
 	}
@@ -204,79 +208,266 @@ static inline void set_nibble_upper(uint8_t& val, uint8_t nibble)
 }
 
 /******************************************
- * Structure I/O
+ * I/O Manager
  *****************************************/
 
-/* Common function to read bytes from a file */
-static std::error_code read_bytes(void* bytes, const size_t size,
-                                  std::filebuf& file, const std::streamoff offset,
-                                  const std::ios_base::seekdir dir = std::ios_base::beg)
+LRUCache::LRUCache(std::size_t size)
+        : cache_list{},
+          cache_map{},
+          backing_store(size * sector_size),
+          cache_size(size)
+{}
+
+/* Test if the given key is in the cache */
+bool LRUCache::in_cache(const uint64_t key)
 {
-	auto ssize = static_cast<std::streamsize>(size);
-	auto b     = reinterpret_cast<char*>(bytes);
-	if (file.pubseekoff(offset, dir) == pos_err) {
-		return make_ec(ErrorCode::IOSeek);
-	}
-	if (file.sgetn(b, ssize) != ssize) {
-		return make_ec(ErrorCode::IORead);
-	}
-	return std::error_code{};
+	return cache_map.find(key) != cache_map.end();
 }
 
-/* Common function to write bytes to a file */
-static std::error_code write_bytes(const void* bytes, const size_t size,
-                                   std::filebuf& file, const std::streamoff offset,
-                                   const std::ios_base::seekdir dir = std::ios_base::beg)
+/* Get the pointer to data at key. You MUST check
+   if the key is in the cache first with in_cache() */
+uint8_t* LRUCache::get(const uint64_t key)
 {
-	auto ssize = static_cast<std::streamsize>(size);
-	auto b     = reinterpret_cast<const char*>(bytes);
-	if (file.pubseekoff(offset, dir) == pos_err) {
-		return make_ec(ErrorCode::IOSeek);
-	}
-	if (file.sputn(b, ssize) != ssize) {
-		return make_ec(ErrorCode::IOWrite);
-	}
-	return std::error_code{};
+	auto it = cache_map[key];
+	move_to_front(it);
+	return (*it).val;
 }
 
-/* Writes zero sectors to the file */
-static std::error_code write_sector_padding(std::filebuf& file, const uint32_t count,
-                                            const std::streamoff offset)
+/* Set a value to the cache, using the supplied key. */
+void LRUCache::set(const uint64_t key, const void* val)
+{
+	if (in_cache(key)) {
+		move_to_front(cache_map[key]);
+	} else if (cache_map.size() < cache_size) {
+		std::size_t curr_size = cache_map.size();
+		uint8_t* new_data = backing_store.data() + (curr_size * sector_size);
+		cache_list.emplace_front(Node{key, new_data});
+		cache_map.emplace(key, cache_list.begin());
+
+	} else {
+		auto last = --cache_list.end();
+		move_to_front(last);
+		cache_map.erase(cache_list.front().key);
+		cache_map.try_emplace(key, cache_list.begin());
+		cache_list.front().key = key;
+	}
+	memcpy(cache_list.front().val, val, sector_size);
+}
+
+/* Clears the cache */
+void LRUCache::clear()
+{
+	cache_map.clear();
+	cache_list.clear();
+	std::fill(backing_store.begin(), backing_store.end(), 0);
+}
+
+void LRUCache::move_to_front(typename std::list<Node>::iterator it)
+{
+	cache_list.splice(cache_list.begin(), cache_list, it);
+}
+
+/* The IO Manager class handles all file I/O in libdiskimg. Fixed sized
+   reads and writes will be cached. The class keeps track of the file
+   position to minimize needing to seek (and therefore flush) the file
+   between consecutive reads or writes.
+
+   Note that the ChunkKey template parameter MUST be an integral */
+
+IOManager::IOManager(std::size_t cache_size) : img(), chunk_cache(cache_size) {}
+
+std::error_code IOManager::open_file(fs::path path, ios::openmode open_mode)
 {
 	std::error_code ec;
-	std::streamoff off = offset;
-	for (uint32_t i = 0; i < count; ++i) {
-		if ((ec = write_bytes(zero_data.data(), zero_data.size(), file, off))) {
-			return ec;
-		}
-		off += zero_data.size();
+
+	/* Sanity check that path points to a valid file */
+	auto file_status = fs::status(path, ec);
+	if (ec) {
+		return ec;
+	}
+
+	auto ft = file_status.type();
+	if (ft == fs::file_type::not_found) {
+		return make_ec(ErrorCode::NotFound);
+	} else if (ft == fs::file_type::unknown) {
+		return make_ec(ErrorCode::NoAttributes);
+	} else if (ft != fs::file_type::regular) {
+		return make_ec(ErrorCode::NotFile);
+	}
+	if (!img.open(path, open_mode)) {
+		/* Unfortunately a more specific error isn't available */
+		return make_ec(ErrorCode::OpenError);
 	}
 	return ec;
 }
 
-/* Reads a structure from file into a struct/class
-   The struct or class must NOT have padding */
-template <typename S>
-static std::error_code read_structure(S& structure, std::filebuf& file,
-                                      const std::streamoff offset,
-                                      const std::ios_base::seekdir dir = std::ios_base::beg)
+std::error_code IOManager::create_file(fs::path path, uintmax_t size)
 {
-	constexpr auto size = sizeof(S);
-	auto b              = reinterpret_cast<void*>(&structure);
-	return read_bytes(b, size, file, offset, dir);
+	std::error_code ec;
+	if (!img.open(path, create_mode)) {
+		/* Unfortunately a more specific error isn't available */
+		return make_ec(ErrorCode::OpenError);
+	}
+	img.close();
+	if (size > 0) {
+		fs::resize_file(path, size, ec);
+		if (ec) {
+			return ec;
+		}
+	}
+	if (!img.open(path, rw_mode)) {
+		/* Unfortunately a more specific error isn't available */
+		return make_ec(ErrorCode::OpenError);
+	}
+	return ec;
 }
 
-/* Writes a structure to file from a struct/class
-   The struct or class must NOT have padding */
-template <typename S>
-static std::error_code write_structure(
-        S const& structure, std::filebuf& file, const std::streamoff offset,
-        const std::ios_base::seekdir dir = std::ios_base::beg)
+std::filebuf& IOManager::file()
 {
-	constexpr auto size = sizeof(S);
-	auto b              = reinterpret_cast<const void*>(&structure);
-	return write_bytes(b, size, file, offset, dir);
+	return img;
 }
+
+/* Read a fixed size chunk (such as a sector).
+
+        The chunk will be served from the cache if possible, otherwise
+        it will be read from the from the file. The chunk will be saved
+        to a user supplied buffer. The buffer MUST be large enough
+        to store a chunk. */
+std::error_code IOManager::read_chunk(void* dest, uint64_t chunk, std::streamoff offset)
+{
+	std::error_code ec;
+	if (chunk_cache.in_cache(chunk)) {
+		uint8_t* c = chunk_cache.get(chunk);
+		memcpy(dest, c, sector_size);
+		return ec;
+	}
+	if ((ec = read_bytes(dest, sector_size, offset))) {
+		return ec;
+	}
+	chunk_cache.set(chunk, static_cast<const void*>(dest));
+	return ec;
+}
+
+/* Write a fixed size chunk (such as a sector).
+
+        The chunk will be written from buffer provided at src
+        to the file. If the chunk exists in the cache, it will
+        be updated, otherwise a new entry will be created. */
+std::error_code IOManager::write_chunk(const void* src, uint64_t chunk,
+                                       std::streamoff offset)
+{
+	std::error_code ec;
+	next_write_preserve_cache();
+	if ((ec = write_bytes(src, sector_size, offset))) {
+		return ec;
+	}
+	chunk_cache.set(chunk, src);
+	return ec;
+}
+
+/* Read num_bytes bytes to supplied buffer dest from offset. This reads
+        directly from the file, bypassing the chunk cache */
+std::error_code IOManager::read_bytes(void* dest, uint64_t num_bytes,
+                                      std::streamoff offset, ios::seekdir dir)
+{
+	auto ssize = static_cast<std::streamsize>(num_bytes);
+	auto b     = reinterpret_cast<char*>(dest);
+
+	if (prev_state != PrevState::Read || curr_offset != offset) {
+		auto pos = img.pubseekoff(offset, dir);
+		if (pos == pos_err) {
+			prev_state = PrevState::Unknown;
+			return make_ec(ErrorCode::IOSeek);
+		}
+		curr_offset = std::streamoff(pos);
+	}
+	if (img.sgetn(b, ssize) != ssize) {
+		prev_state = PrevState::Unknown;
+		return make_ec(ErrorCode::IORead);
+	}
+	curr_offset += ssize;
+	return std::error_code{};
+}
+
+/* Write num_bytes bytes from src buffer, to offset. The chunk cache
+        will be cleared unless next_write_preserve_cache() is called prior
+        to write_bytes() */
+std::error_code IOManager::write_bytes(const void* src, uint64_t num_bytes,
+                                       std::streamoff offset, ios::seekdir dir)
+{
+	/* Bytes could be written anywhere so cannot guarantee cache
+	        consistancy afterwards */
+	if (preserve_cache) {
+		preserve_cache = false;
+	} else {
+		chunk_cache.clear();
+	}
+	auto ssize = static_cast<std::streamsize>(num_bytes);
+	auto b     = reinterpret_cast<const char*>(src);
+	if (prev_state != PrevState::Write || offset != curr_offset) {
+		auto pos = img.pubseekoff(offset, dir);
+		if (pos == pos_err) {
+			prev_state = PrevState::Unknown;
+			return make_ec(ErrorCode::IOSeek);
+		}
+		curr_offset = std::streamoff(pos);
+	}
+	if (img.sputn(b, ssize) != ssize) {
+		prev_state = PrevState::Unknown;
+		return make_ec(ErrorCode::IOWrite);
+	}
+	curr_offset += ssize;
+	prev_state = PrevState::Write;
+	return std::error_code{};
+}
+
+/* Read a (packed) structure from file into the structure supplied.
+        The caller is responsible for ensuring the provided structure
+        is packed (if required), and for endian handling. */
+template <typename Structure>
+std::error_code IOManager::read_structure(Structure& s, std::streamoff offset,
+                                          ios::seekdir dir)
+{
+	constexpr auto size = sizeof(Structure);
+	auto b              = reinterpret_cast<void*>(&s);
+	return read_bytes(b, size, offset, dir);
+}
+
+/* Write a (packed) structure to file from the structure supplied.
+        The caller is responsible for ensuring the provided structure
+        is packed (if required), and for endian handling. */
+template <typename Structure>
+std::error_code IOManager::write_structure(Structure const& s,
+                                           std::streamoff offset, ios::seekdir dir)
+{
+	constexpr auto size = sizeof(Structure);
+	auto b              = reinterpret_cast<const void*>(&s);
+	return write_bytes(b, size, offset, dir);
+}
+
+std::streamoff IOManager::offset_at(std::streamoff rel_offset, ios::seekdir dir)
+{
+	prev_state  = PrevState::Unknown;
+	curr_offset = std::streamoff(img.pubseekoff(rel_offset, dir));
+	return curr_offset;
+}
+
+/* Flush the file. Use to ensure headers/footers are synced to the file */
+int IOManager::flush()
+{
+	return img.pubsync();
+}
+
+/* By default, write_bytes() clears the chunk cache. This method
+        will preserve the cache for the next call to write_bytes() */
+void IOManager::next_write_preserve_cache()
+{
+	preserve_cache = true;
+}
+
+/******************************************
+ * VHD file tests
+ *****************************************/
 
 /* Check if a buffer contains the "conectix" string */
 static bool buffer_has_vhd_id(std::array<char, footer_sig.size()> const& buff)
@@ -563,7 +754,7 @@ std::error_code VHD::bat_read_table()
 	bat.resize(bat_total_elements(), sparse_block_off);
 	auto b      = reinterpret_cast<char*>(bat.data());
 	auto offset = static_cast<std::streamoff>(header.bat_offset);
-	if ((ec = read_bytes(b, bat_size_bytes(), f, offset))) {
+	if ((ec = io.read_bytes(b, bat_size_bytes(), offset))) {
 		return ec;
 	}
 	for (auto& bat_offset : bat) {
@@ -590,7 +781,8 @@ std::error_code VHD::bat_write_table()
 	}
 	auto b      = reinterpret_cast<char*>(bat_buff.data());
 	auto offset = static_cast<std::streamoff>(header.bat_offset);
-	if ((ec = write_bytes(b, bat_size_bytes(), f, offset))) {
+	io.next_write_preserve_cache();
+	if ((ec = io.write_bytes(b, bat_size_bytes(), offset))) {
 		return ec;
 	}
 	return ec;
@@ -626,7 +818,10 @@ std::error_code VHD::bat_create_block(uint32_t block_num)
 	auto end = std::ios_base::end;
 	std::error_code ec;
 	std::string footer_cookie("conectix");
-	if ((ec = read_bytes(footer_cookie.data(), footer_cookie.size(), f, footer_offset, end))) {
+	if ((ec = io.read_bytes(footer_cookie.data(),
+	                        footer_cookie.size(),
+	                        footer_offset,
+	                        end))) {
 		return ec;
 	}
 	std::streamoff rel_offset = footer_offset;
@@ -635,33 +830,35 @@ std::error_code VHD::bat_create_block(uint32_t block_num)
 	if (footer_cookie != footer_sig) {
 		rel_offset = 0;
 	}
-	auto pos = std::streamoff(f.pubseekoff(rel_offset, end));
+	std::streamoff pos = io.offset_at(rel_offset, end);
 	/* Writes must be aligned to sector boundary, add margin if required */
 	auto margin        = pos % sector_size;
 	auto offset        = pos + margin;
 	auto sector_offset = static_cast<uint32_t>(offset / sector_size);
 	/* Read the spare "footer" into memory to write at the end of the file*/
 	std::array<char, footer_size> header_buff;
-	if ((ec = read_bytes(header_buff.data(), footer_size, f, 0))) {
+	if ((ec = io.read_bytes(header_buff.data(), footer_size, 0))) {
 		return ec;
 	}
 	/* Write the new sector bitmap + block */
 	if (margin > 0) {
-		if ((ec = write_bytes(zero_data.data(),
-		                      static_cast<std::size_t>(margin),
-		                      f,
-		                      pos))) {
+		io.next_write_preserve_cache();
+		if ((ec = io.write_bytes(zero_data.data(),
+		                         static_cast<std::size_t>(margin),
+		                         pos))) {
 			return ec;
 		}
 	}
 	for (int i = 0; i < sectors_per_block + sb_num_sectors; ++i) {
-		if ((ec = write_bytes(zero_data.data(), zero_data.size(), f, offset))) {
+		io.next_write_preserve_cache();
+		if ((ec = io.write_bytes(zero_data.data(), zero_data.size(), offset))) {
 			return ec;
 		}
 		offset += sector_size;
 	}
 	/* Append the footer back to the end of the file */
-	if ((ec = write_bytes(header_buff.data(), header_buff.size(), f, 0, end))) {
+	io.next_write_preserve_cache();
+	if ((ec = io.write_bytes(header_buff.data(), header_buff.size(), 0, end))) {
 		return ec;
 	}
 	/* Finally update the block offset and write table */
@@ -679,139 +876,78 @@ bool VHD::bat_block_is_sparse(uint32_t block_num)
 	return bat[block_num] == sparse_block_off;
 }
 
-/******************************************
- * I/O Management
- *****************************************/
-
-/* File I/O uses a Least Recently Used (LRU) cache for caching
-   sector reads. Sectors are cached in 4KiB chunks. Only reads
-   populate the cache. Writes will update the cache if an entry
-   exists.
-
-   There is also a LRU cache to manage the sector bitmaps. This
-   cache is populated on both reads and writes */
-
-/* Get the 4KiB chunk that a sector is in */
-static inline uint32_t calc_chunk_num(uint32_t sector_num)
+/* To avoid clashing with sector numbers in the cache
+   store sector bitmap keys in the upper bytes of the key.
+   Using 1-based block numbers to avoid sector bitmap 0  
+   conflicting with sector 0 */
+static uint64_t sb_key(uint32_t block_num)
 {
-	return (sector_num * sector_size) / lru_chunk_size;
+	return static_cast<uint64_t>(block_num + 1) << 32;
 }
 
-/* How many sectors into the chunk is a given sector */
-static inline uint32_t offset_in_chunk(uint32_t sector_num)
-{
-	return (sector_num * sector_size) % lru_chunk_size;
-}
-
-/* What is the absolute offset for a given chunk */
-static inline std::streamoff abs_chunk_offset(uint32_t chunk_num)
-{
-	return static_cast<std::streamoff>(chunk_num) * lru_chunk_size;
-}
-
-bool VHD::sector_in_cache(uint32_t sector_num)
-{
-	return sector_cache.in_cache(calc_chunk_num(sector_num));
-}
-
-void VHD::read_sector_from_cache(uint32_t sector_num, void* dest)
-{
-	uint32_t chunk_num = calc_chunk_num(sector_num);
-	uint32_t oic       = offset_in_chunk(sector_num);
-	auto d             = reinterpret_cast<uint8_t*>(dest);
-	auto& chunk        = sector_cache.get(chunk_num);
-	memcpy(d, chunk.data() + oic, sector_size);
-}
-
-void VHD::write_sector_to_cache(uint32_t sector_num, const void* src)
-{
-	uint32_t chunk_num = calc_chunk_num(sector_num);
-	if (sector_in_cache(sector_num)) {
-		uint32_t oic = offset_in_chunk(sector_num);
-		auto& chunk  = sector_cache.get(chunk_num);
-		auto s       = reinterpret_cast<const uint8_t*>(src);
-		memcpy(chunk.data() + oic, s, sector_size);
-	}
-}
-
-bool VHD::sb_in_cache(uint32_t block_num)
-{
-	return sb_cache.in_cache(block_num);
-}
-
-/* Test for a dirty sector */
-bool VHD::sb_test(uint32_t block_num, uint32_t sib)
-{
-	auto& sb = sb_cache.get(block_num);
-	return static_cast<bool>(sb[sib / 8] & (1 << (7 - (sib % 8))));
-}
-
-/* Set a sector to be dirty */
-void VHD::sb_set(uint32_t block_num, uint32_t sib)
-{
-	auto& sb = sb_cache.get(block_num);
-	sb[sib / 8] |= 1 << (7 - (sib % 8));
-}
-
-/* Read the sector bitmap for a block from file */
-std::error_code VHD::sb_read_from_file(uint32_t block_num)
+std::error_code VHD::sb_get(uint32_t block_num)
 {
 	std::error_code ec;
+	curr_sb.fill(0);
 	auto sb_offset = static_cast<std::streamoff>(bat[block_num]) * sector_size;
-	sb_cache.set(block_num, zero_data);
 	if (bat_block_is_sparse(block_num)) {
 		return ec;
 	}
-	auto& cache_ent = sb_cache.get(block_num);
-	return read_bytes(cache_ent.data(), cache_ent.size(), f, sb_offset);
+	return io.read_chunk(curr_sb.data(), sb_key(block_num), sb_offset);
 }
 
-/* Write the sector bitmap for a block to file */
-std::error_code VHD::sb_write_to_file(uint32_t block_num)
+std::error_code VHD::sb_save(uint32_t block_num)
 {
 	std::error_code ec;
 	auto sb_offset = static_cast<std::streamoff>(bat[block_num]) * sector_size;
-	if (bat_block_is_sparse(block_num) || !sb_in_cache(block_num)) {
+	if (bat_block_is_sparse(block_num)) {
 		return ec;
 	}
-	auto& cache_ent = sb_cache.get(block_num);
-	return write_bytes(cache_ent.data(), cache_ent.size(), f, sb_offset);
+	return io.write_chunk(curr_sb.data(), sb_key(block_num), sb_offset);
 }
 
-/* Clear caches in an emergency */
-void VHD::clear_caches()
+/* Test for a dirty sector */
+bool VHD::sb_test(uint32_t sib)
 {
-	sector_cache.clear();
-	sb_cache.clear();
+	return static_cast<bool>(curr_sb[sib / 8] & (1 << (7 - (sib % 8))));
+}
+
+/* Set a sector to be dirty */
+void VHD::sb_set(uint32_t sib)
+{
+	curr_sb[sib / 8] |= 1 << (7 - (sib % 8));
+}
+
+std::error_code VHD::write_sector_padding(const uint32_t count,
+                                          const std::streamoff offset)
+{
+	std::error_code ec;
+	std::streamoff off = offset;
+	for (uint32_t i = 0; i < count; ++i) {
+		if ((ec = io.write_bytes(zero_data.data(), zero_data.size(), off))) {
+			return ec;
+		}
+		off += zero_data.size();
+	}
+	return ec;
 }
 
 /* Constructor to open an existing VHD image
    Called by VHD::open */
 VHD::VHD(fs::path const& vhd_path, bool read_only)
-        : f(),
+        : ro(read_only),
           footer{},
           header{},
-		  ro(read_only),
           bat{},
-          sector_cache(lru_cache_limit),
-          sb_cache(sb_cache_limit)
+          io(cache_size)
 {
 	auto mode = read_only ? ro_mode : rw_mode;
 	std::error_code ec;
 
 	/* Sanity check that path points to a valid file */
-	auto file_status = fs::status(vhd_path, ec);
-	if (ec) {
-		throw std::system_error(ec);
-	}
 
-	auto ft = file_status.type();
-	if (ft == fs::file_type::not_found) {
-		throw std::system_error(make_ec(ErrorCode::NotFound));
-	} else if (ft == fs::file_type::unknown) {
-		throw std::system_error(make_ec(ErrorCode::NoAttributes));
-	} else if (ft != fs::file_type::regular) {
-		throw std::system_error(make_ec(ErrorCode::NotFile));
+	if ((ec = io.open_file(vhd_path, mode))) {
+		throw std::system_error(ec);
 	}
 
 	const auto file_size = fs::file_size(vhd_path, ec);
@@ -819,20 +955,11 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 		throw std::system_error(ec);
 	}
 
-	/* Because this library is likely to perform random I/O, a buffer
-	   is not necessary, and simplifies book keeping by not having one */
-	f.pubsetbuf(nullptr, 0);
-
-	if (!f.open(vhd_path, mode)) {
-		/* Unfortunately a more specific error isn't available */
-		throw std::system_error(make_ec(ErrorCode::OpenError));
-	}
-
-	if (!VHD::file_is_vhd(f)) {
+	if (!VHD::file_is_vhd(io.file())) {
 		throw std::system_error(make_ec(ErrorCode::NotVHD));
 	}
 
-	if ((ec = read_structure(footer, f, footer_offset, std::ios_base::end))) {
+	if ((ec = io.read_structure(footer, footer_offset, std::ios_base::end))) {
 		throw std::system_error(ec);
 	}
 
@@ -840,7 +967,7 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 	if (!buffer_has_vhd_id(footer.cookie)) {
 		end_footer_missing = true;
 		/* Try the beginning */
-		if ((ec = read_structure(footer, f, 0, std::ios_base::beg))) {
+		if ((ec = io.read_structure(footer, 0))) {
 			throw std::system_error(ec);
 		}
 	}
@@ -865,7 +992,7 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 	}
 	/* Otherwise, continue loading the file */
 	Footer backup_footer;
-	if ((ec = read_structure(backup_footer, f, 0))) {
+	if ((ec = io.read_structure(backup_footer, 0))) {
 		throw std::system_error(ec);
 	}
 	backup_footer.from_be();
@@ -879,9 +1006,8 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 		throw std::system_error(make_ec(ErrorCode::Corrupt));
 	}
 
-	if ((ec = read_structure(header,
-	                         f,
-	                         static_cast<std::streamoff>(footer.data_offset)))) {
+	if ((ec = io.read_structure(header,
+	                            static_cast<std::streamoff>(footer.data_offset)))) {
 		throw std::system_error(ec);
 	}
 	header.from_be();
@@ -931,11 +1057,10 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 		if (plat_code == plat_code_win_rel) {
 			std::vector<char16_t> path_buff;
 			path_buff.resize(loc.plat_data_len / sizeof(char16_t));
-			if ((ec = read_bytes(path_buff.data(),
-			                     path_buff.size() * sizeof(char16_t),
-			                     f,
-			                     static_cast<std::streamoff>(
-			                             loc.plat_data_offset)))) {
+			if ((ec = io.read_bytes(path_buff.data(),
+			                        path_buff.size() * sizeof(char16_t),
+			                        static_cast<std::streamoff>(
+			                                loc.plat_data_offset)))) {
 				throw std::system_error(ec);
 			}
 			/* TODO: Handle path endianess */
@@ -963,12 +1088,11 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 /* Constructor to create a fixed VHD image
    Called by VHD::create_fixed */
 VHD::VHD(fs::path const& vhd_path, Geom const& geom)
-        : f(),
+        : ro(false),
           footer{},
           header{},
           bat{},
-          sector_cache(lru_cache_limit),
-          sb_cache(sb_cache_limit)
+          io(cache_size)
 {
 	std::error_code ec;
 	if (vhd_path.empty() || geom.num_sectors() == 0) {
@@ -984,22 +1108,11 @@ VHD::VHD(fs::path const& vhd_path, Geom const& geom)
 	Footer tmp_footer = footer;
 	tmp_footer.to_be();
 
-	f.pubsetbuf(nullptr, 0);
-
-	if (!f.open(vhd_path, create_mode)) {
-		/* Unfortunately a more specific error isn't available */
-		throw std::system_error(make_ec(ErrorCode::OpenError));
-	}
-	f.close();
-	fs::resize_file(vhd_path, footer.curr_sz, ec);
-	if (ec) {
+	if ((ec = io.create_file(vhd_path, footer_size))) {
 		throw std::system_error(ec);
 	}
-	if (!f.open(vhd_path, rw_mode)) {
-		/* Unfortunately a more specific error isn't available */
-		throw std::system_error(make_ec(ErrorCode::OpenError));
-	}
-	if ((ec = write_structure(tmp_footer, f, 0, std::ios_base::end))) {
+
+	if ((ec = io.write_structure(tmp_footer, 0, std::ios_base::end))) {
 		throw std::system_error(ec);
 	}
 }
@@ -1008,12 +1121,11 @@ VHD::VHD(fs::path const& vhd_path, Geom const& geom)
    Called by VHD::create_sparse and VHD::create_diff */
 VHD::VHD(fs::path const& vhd_path, VHDType const vhd_type, Geom const& geom,
          BlockSize block_size, fs::path const& par_path)
-        : f(),
+        : ro(false),
           footer{},
           header{},
           bat{},
-          sector_cache(lru_cache_limit),
-          sb_cache(sb_cache_limit)
+          io(cache_size)
 {
 	std::error_code ec;
 	if (vhd_path.empty() || !is_one_of(vhd_type, VHDType::Sparse, VHDType::Diff)) {
@@ -1108,33 +1220,21 @@ VHD::VHD(fs::path const& vhd_path, VHDType const vhd_type, Geom const& geom,
 	SparseHeader tmp_header = header;
 	tmp_header.to_be();
 
-	/* Start writing out to file */
-
-	f.pubsetbuf(nullptr, 0);
-
-	if (!f.open(vhd_path, create_mode)) {
-		/* Unfortunately a more specific error isn't available */
-		throw std::system_error(make_ec(ErrorCode::OpenError));
-	}
-	f.close();
-	if (!f.open(vhd_path, rw_mode)) {
-		/* Unfortunately a more specific error isn't available */
-		throw std::system_error(make_ec(ErrorCode::OpenError));
-	}
-	if ((ec = write_structure(tmp_footer, f, 0))) {
+	if ((ec = io.create_file(vhd_path))) {
 		throw std::system_error(ec);
 	}
-	if ((ec = write_structure(tmp_header,
-	                          f,
-	                          static_cast<std::streamoff>(footer.data_offset)))) {
+	if ((ec = io.write_structure(tmp_footer, 0))) {
+		throw std::system_error(ec);
+	}
+	if ((ec = io.write_structure(tmp_header,
+	                             static_cast<std::streamoff>(footer.data_offset)))) {
 		throw std::system_error(ec);
 	}
 
 	if ((ec = bat_write_table())) {
 		throw std::system_error(ec);
 	}
-	if ((ec = write_sector_padding(f,
-	                               bat_loc_padding,
+	if ((ec = write_sector_padding(bat_loc_padding,
 	                               static_cast<std::streamoff>(
 	                                       header.bat_offset + bat_size_bytes())))) {
 		throw std::system_error(ec);
@@ -1147,15 +1247,15 @@ VHD::VHD(fs::path const& vhd_path, VHDType const vhd_type, Geom const& geom,
 		std::copy(rel_parent_path.begin(),
 		          rel_parent_path.end(),
 		          par_loc_buff.begin());
-		if ((ec = write_bytes(par_loc_buff.data(),
-		                      par_loc_buff.size() * sizeof(char16_t),
-		                      f,
-		                      static_cast<std::streamoff>(
-		                              header.par_loc_entries[0].plat_data_offset)))) {
+		if ((ec = io.write_bytes(
+		             par_loc_buff.data(),
+		             par_loc_buff.size() * sizeof(char16_t),
+		             static_cast<std::streamoff>(
+		                     header.par_loc_entries[0].plat_data_offset)))) {
 			throw std::system_error(ec);
 		}
 	}
-	if ((ec = write_structure(tmp_footer, f, 0, std::ios_base::end))) {
+	if ((ec = io.write_structure(tmp_footer, 0, std::ios_base::end))) {
 		throw std::system_error(ec);
 	}
 }
@@ -1250,43 +1350,30 @@ std::error_code VHD::read_sector(uint32_t const sector_num, void* dest)
 		return make_ec(ErrorCode::SectorOutOfRange);
 	}
 	std::error_code ec;
-	uint32_t chunk_num = calc_chunk_num(sector_num);
-	std::streamoff chunk_offset;
 
 	if (footer.disk_type == VHDType::Fixed) {
-		chunk_offset = abs_chunk_offset(chunk_num);
-	} else {
-		uint32_t block_num = calc_block_num(sector_num);
-		uint32_t sib       = calc_sib(sector_num);
-		if (!sb_in_cache(block_num)) {
-			if ((ec = sb_read_from_file(block_num))) {
-				return ec;
-			}
-		}
-		bool sector_is_dirty = sb_test(block_num, sib);
-		if (!sector_is_dirty && footer.disk_type == VHDType::Diff) {
-			return parent->read_sector(sector_num, dest);
-		}
-		if (bat_block_is_sparse(block_num)) {
-			memcpy(dest, zero_data.data(), sector_size);
-			return ec;
-		}
-		auto abs_block_offset = static_cast<std::streamoff>(
-		                                bat[block_num] + 1) *
-		                        sector_size;
-		uint32_t chunk_num_in_block = calc_chunk_num(sib);
-		chunk_offset                = abs_block_offset +
-		               abs_chunk_offset(chunk_num_in_block);
+		auto sector_offset = static_cast<std::streamoff>(sector_num) *
+		                     sector_size;
+		return io.read_chunk(dest, sector_num, sector_offset);
 	}
-	if (!sector_in_cache(sector_num)) {
-		sector_cache.set(chunk_num, std::array<uint8_t, lru_chunk_size>{});
-		auto& c = sector_cache.get(chunk_num);
-		if ((ec = read_bytes(c.data(), c.size(), f, chunk_offset))) {
-			return ec;
-		}
+
+	uint32_t block_num = calc_block_num(sector_num);
+	uint32_t sib       = calc_sib(sector_num);
+	if ((ec = sb_get(block_num))) {
+		return ec;
 	}
-	read_sector_from_cache(sector_num, dest);
-	return ec;
+	bool sector_is_dirty = sb_test(sib);
+	if (!sector_is_dirty && footer.disk_type == VHDType::Diff) {
+		return parent->read_sector(sector_num, dest);
+	}
+	if (bat_block_is_sparse(block_num)) {
+		memcpy(dest, zero_data.data(), sector_size);
+		return ec;
+	}
+	auto abs_sector_offset = static_cast<std::streamoff>(bat[block_num] + 1 + sib) *
+	                         sector_size;
+
+	return io.read_chunk(dest, sector_num, abs_sector_offset);
 }
 
 /* Write a single sector at sector_num offset to the VHD
@@ -1304,50 +1391,32 @@ std::error_code VHD::write_sector(uint32_t const sector_num, const void* src)
 	std::error_code ec;
 	if (footer.disk_type == VHDType::Fixed) {
 		auto offset = static_cast<std::streamoff>(sector_num) * sector_size;
-		if ((ec = write_bytes(src, sector_size, f, offset))) {
-			clear_caches();
+		return io.write_chunk(src, sector_num, offset);
+	}
+
+	uint32_t block_num = calc_block_num(sector_num);
+	uint32_t sib       = calc_sib(sector_num);
+
+	bool source_is_zero = (memcmp(src, zero_data.data(), sector_size) == 0);
+	if (bat_block_is_sparse(block_num)) {
+		if (source_is_zero) {
 			return ec;
 		}
-	} else {
-		uint32_t block_num = calc_block_num(sector_num);
-		uint32_t sib       = calc_sib(sector_num);
-		if (!sb_in_cache(block_num)) {
-			if ((ec = sb_read_from_file(block_num))) {
-				clear_caches();
-				return ec;
-			}
-		}
-		bool sector_is_dirty = sb_test(block_num, sib);
-		if (!sector_is_dirty) {
-			sb_set(block_num, sib);
-			if ((ec = sb_write_to_file(block_num))) {
-				clear_caches();
-				return ec;
-			}
-		}
-		bool sourcce_is_zero = (memcmp(src, zero_data.data(), sector_size) ==
-		                        0);
-		if (bat_block_is_sparse(block_num)) {
-			if (sourcce_is_zero) {
-				return ec;
-			}
-			if ((ec = bat_create_block(block_num))) {
-				clear_caches();
-				return ec;
-			}
-		}
-		auto abs_sector_offset = static_cast<std::streamoff>(
-		                                 bat[block_num] + 1 + sib) *
-		                         sector_size;
-		if ((ec = write_bytes(src, sector_size, f, abs_sector_offset))) {
-			clear_caches();
+		if ((ec = bat_create_block(block_num))) {
 			return ec;
 		}
 	}
-	if (sector_in_cache(sector_num)) {
-		write_sector_to_cache(sector_num, src);
+	if ((ec = sb_get(block_num))) {
+		return ec;
 	}
-	return ec;
+	bool sector_is_dirty = sb_test(sib);
+	if (!sector_is_dirty) {
+		sb_set(sib);
+		sb_save(block_num);
+	}
+	auto abs_sector_offset = static_cast<std::streamoff>(bat[block_num] + 1 + sib) *
+	                         sector_size;
+	return io.write_chunk(src, sector_num, abs_sector_offset);
 }
 
 /* Get the geometry (CHS) of a VHD image */
