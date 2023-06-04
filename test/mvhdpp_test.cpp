@@ -90,6 +90,9 @@ DRESULT disk_ioctl (BYTE pdrv, BYTE cmd, void* buff)
     return res;
 }
 
+#ifdef _MSC_VER
+#pragma warning( disable : 4996 )
+#endif
 DWORD get_fattime (void)
 {
     time_t t;
@@ -179,11 +182,11 @@ int prepare_img(MVHDPP::VHD* vhd)
     LBA_t plist[] = {100, 0};
     FRESULT res;
 
-    if ((res = f_fdisk(0, plist, work))) {
+    if ((res = f_fdisk(0, plist, work)) != 0) {
         std::cout << "fdisk failed" << std::endl;
         return 10;
     }
-    if ((res = f_mkfs("0:", 0, work, sizeof work))) {
+    if ((res = f_mkfs("0:", 0, work, sizeof work)) != 0) {
         std::cout << "fdisk failed" << std::endl;
         return 11;
     }
@@ -198,11 +201,11 @@ std::string create_write_file(MVHDPP::VHD* vhd, const char* file_path)
     FIL fil;            /* File object */
     FRESULT res;        /* API result code */
     UINT bw;            /* Bytes written */
-    if ((res = f_mount(&fs, "0:", 0))) {
+    if ((res = f_mount(&fs, "0:", 0)) != 0) {
         std::cout << "mount failed" << std::endl;
         return "";
     }
-    if ((res = f_open(&fil, file_path, FA_CREATE_NEW | FA_WRITE))) {
+    if ((res = f_open(&fil, file_path, FA_CREATE_NEW | FA_WRITE)) != 0) {
         f_mount(0, "", 0);
         std::cout << "open failed" << std::endl;
         return "";
@@ -211,7 +214,7 @@ std::string create_write_file(MVHDPP::VHD* vhd, const char* file_path)
     int pos = 0;
     while (pos < test_file_size) {
         auto& data = td.get_next();
-        UINT size = data.size() * sizeof *data.data();
+        UINT size = static_cast<UINT>(data.size() * sizeof *data.data());
         f_write(&fil, data.data(), size, &bw); 
         if (bw != size) {
             f_close(&fil);
@@ -235,11 +238,11 @@ int read_file(MVHDPP::VHD* vhd, const char* file_path, std::string const& expect
     FIL fil;            /* File object */
     FRESULT res;        /* API result code */
     UINT br;            /* Bytes read */
-    if ((res = f_mount(&fs, "0:", 0))) {
+    if ((res = f_mount(&fs, "0:", 0)) != 0) {
         std::cout << "mount failed" << std::endl;
         return 10;
     }
-    if ((res = f_open(&fil, file_path, FA_READ))) {
+    if ((res = f_open(&fil, file_path, FA_READ)) != 0) {
         f_mount(0, "", 0);
         std::cout << "open failed" << std::endl;
         return 11;
@@ -249,7 +252,7 @@ int read_file(MVHDPP::VHD* vhd, const char* file_path, std::string const& expect
     std::array<uint8_t, SIZE_OF_SHA_256_HASH> hash = {};
     sha_256_init(&sha, hash.data());
     for (;;) {
-        f_read(&fil, buff.data(), buff.size(), &br);
+        f_read(&fil, buff.data(), static_cast<UINT>(buff.size()), &br);
         if (br > 0) {
             sha_256_write(&sha, buff.data(), br);
         }

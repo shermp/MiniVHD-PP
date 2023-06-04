@@ -261,7 +261,7 @@ void LRUCache::clear()
 {
 	cache_map.clear();
 	cache_list.clear();
-	std::fill(backing_store.begin(), backing_store.end(), 0);
+	std::fill(backing_store.begin(), backing_store.end(), static_cast<uint8_t>(0U));
 }
 
 void LRUCache::move_to_front(typename std::list<Node>::iterator it)
@@ -276,7 +276,7 @@ void LRUCache::move_to_front(typename std::list<Node>::iterator it)
 
    Note that the ChunkKey template parameter MUST be an integral */
 
-IOManager::IOManager(std::size_t cache_size) : img(), chunk_cache(cache_size) {}
+IOManager::IOManager(std::size_t cache_sz) : img(), chunk_cache(cache_sz) {}
 
 std::error_code IOManager::open_file(fs::path path, ios::openmode open_mode)
 {
@@ -650,7 +650,10 @@ bool VHD::Footer::is_valid()
 {
 	if (std::string_view(cookie.data(), cookie.size()) != footer_sig ||
 	    checksum != calc_checksum() ||
-	    !is_one_of(disk_type, VHDType::Fixed, VHDType::Sparse, VHDType::Diff)) {
+	    !is_one_of(static_cast<int>(disk_type),
+	               VHDType::Fixed,
+	               VHDType::Sparse,
+	               VHDType::Diff)) {
 		return false;
 	}
 	if (disk_type == VHDType::Fixed && data_offset != data_offset_unset) {
