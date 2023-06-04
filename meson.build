@@ -57,4 +57,4 @@ test_sources = files(
 t = executable('vhd-test', 
                mvhdpp_sources + test_sources, 
                include_directories : incdir)
-test('VHD Test', t, args : ['test_img.vhd'])
+test('VHD Test', t, workdir : meson.current_source_dir(), args : ['test/test_img_diff.vhd'])
