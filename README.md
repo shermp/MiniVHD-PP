@@ -19,16 +19,17 @@ Alternative, the library is simple enough that you can place the `minivhdpp.h`, 
 ### Open existing VHD
 
 ```cpp
-auto res = MVHDPP::VHD::open(path);
-if (std::holds_alternative<std::error_code>(res)) {
-    auto ec = std::get<std::error_code>(res);
-    std::cout << ec.message() << std::endl;
+MHDPP::VHD vhd;
+std::error_code ec;
+if ((ec = vhd.open(path))) {
     // handle error
 }
-auto vhd = std::get<MVHDPP::VHD>(std::move(res));
 std::array<uint8_t, 512> buff;
 uint32_t sector_num = 0;
-vhd.read_sector(sector_num, buff.data())
+if ((ec = vhd.read_sector(sector_num, buff.data()))) {
+    // handle error
+}
+
 // continue using VHD image. It will automatically close when
 // the object goes out of scope
 ```
@@ -37,17 +38,16 @@ vhd.read_sector(sector_num, buff.data())
 
 ```cpp
 auto geom = MVHDPP::Geom{1024, 16, 63};
-auto res = MVHDPP::VHD::create_fixed(path, geom);
-if (std::holds_alternative<std::error_code>(res)) {
-    auto ec = std::get<std::error_code>(res);
-    std::cout << ec.message() << std::endl;
+MVHDPP::VHD vhd;
+std::error_code ec;
+if ((ec = vhd.create_fixed(path, geom))) {
     // handle error
 }
-auto vhd = std::get<MVHDPP::VHD>(std::move(res));
 std::array<uint8_t, 512> buff;
 uint32_t sector_num = 0;
-vhd.read_sector(sector_num, buff.data())
+if ((ec = vhd.read_sector(sector_num, buff.data()))) {
+    // handle error
+}
 // continue using VHD image. It will automatically close when
 // the object goes out of scope
 ```
-

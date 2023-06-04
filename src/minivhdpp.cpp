@@ -89,6 +89,8 @@ struct VHDErrCat : std::error_category {
 		case ErrorCode::UnsupportedBlockSize:
 			return "unsupported block size";
 		case ErrorCode::SectorOutOfRange: return "sector out of range";
+		case ErrorCode::UseBeforeOpen:
+			return "attempted use before open";
 		case ErrorCode::ReadOnly:
 			return "write to read only image forbidden";
 		default: return "unkown error";
@@ -878,7 +880,7 @@ bool VHD::bat_block_is_sparse(uint32_t block_num)
 
 /* To avoid clashing with sector numbers in the cache
    store sector bitmap keys in the upper bytes of the key.
-   Using 1-based block numbers to avoid sector bitmap 0  
+   Using 1-based block numbers to avoid sector bitmap 0
    conflicting with sector 0 */
 static uint64_t sb_key(uint32_t block_num)
 {
@@ -932,27 +934,32 @@ std::error_code VHD::write_sector_padding(const uint32_t count,
 	return ec;
 }
 
-/* Constructor to open an existing VHD image
-   Called by VHD::open */
-VHD::VHD(fs::path const& vhd_path, bool read_only)
-        : ro(read_only),
+VHD::VHD()
+        : vhd_is_open(false),
+          ro(false),
           footer{},
           header{},
           bat{},
           io(cache_size)
+{}
+
+/* Open an existing VHD, at vhd_path. If read_only is set, the image
+   will be open in read_only mode */
+std::error_code VHD::open(fs::path const& vhd_path, bool read_only)
 {
-	auto mode = read_only ? ro_mode : rw_mode;
 	std::error_code ec;
+	auto mode = read_only ? ro_mode : rw_mode;
+	ro        = read_only;
 
 	/* Sanity check that path points to a valid file */
 
 	if ((ec = io.open_file(vhd_path, mode))) {
-		throw std::system_error(ec);
+		return ec;
 	}
 
 	const auto file_size = fs::file_size(vhd_path, ec);
 	if (ec) {
-		throw std::system_error(ec);
+		return ec;
 	}
 
 	if (!VHD::file_is_vhd(io.file())) {
@@ -960,7 +967,7 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 	}
 
 	if ((ec = io.read_structure(footer, footer_offset, std::ios_base::end))) {
-		throw std::system_error(ec);
+		return ec;
 	}
 
 	bool end_footer_missing = false;
@@ -968,51 +975,52 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 		end_footer_missing = true;
 		/* Try the beginning */
 		if ((ec = io.read_structure(footer, 0))) {
-			throw std::system_error(ec);
+			return ec;
 		}
 	}
 
 	footer.from_be();
 
 	if (!footer.is_valid()) {
-		throw std::system_error(make_ec(ErrorCode::Corrupt));
+		return make_ec(ErrorCode::Corrupt);
 	}
 
 	/* Fixed VHD images should never be missing the footer */
 	if (footer.disk_type == VHDType::Fixed && end_footer_missing) {
-		throw std::system_error(make_ec(ErrorCode::Corrupt));
+		return make_ec(ErrorCode::Corrupt);
 	}
 	/* For fixed VHD files, this is all that is required */
 	if (footer.disk_type == VHDType::Fixed) {
 		// Sanity check the file size
 		if (footer.curr_sz + footer_size > file_size) {
-			throw std::system_error(make_ec(ErrorCode::InvalidSize));
+			return make_ec(ErrorCode::InvalidSize);
 		}
-		return;
+		vhd_is_open = true;
+		return ec;
 	}
 	/* Otherwise, continue loading the file */
 	Footer backup_footer;
 	if ((ec = io.read_structure(backup_footer, 0))) {
-		throw std::system_error(ec);
+		return ec;
 	}
 	backup_footer.from_be();
 	if (backup_footer != footer) {
-		throw std::system_error(make_ec(ErrorCode::Corrupt));
+		return make_ec(ErrorCode::Corrupt);
 	}
 
 	/* Let's be paranoid */
 	if (footer.data_offset == data_offset_unset ||
 	    footer.data_offset > (file_size - footer_size - sparse_size)) {
-		throw std::system_error(make_ec(ErrorCode::Corrupt));
+		return make_ec(ErrorCode::Corrupt);
 	}
 
 	if ((ec = io.read_structure(header,
 	                            static_cast<std::streamoff>(footer.data_offset)))) {
-		throw std::system_error(ec);
+		return ec;
 	}
 	header.from_be();
 	if (!header.is_valid()) {
-		throw std::system_error(make_ec(ErrorCode::Corrupt));
+		return make_ec(ErrorCode::Corrupt);
 	}
 
 	/* To make the sector bitmap easier to work with, don't support blocks
@@ -1020,7 +1028,7 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 	   or 2MiB block sizes. Block sizes larger than 2MiB require multiple
 	   sectors to store the sector bitmap. */
 	if (header.block_sz > block_size_large) {
-		throw std::system_error(make_ec(ErrorCode::UnsupportedBlockSize));
+		return make_ec(ErrorCode::UnsupportedBlockSize);
 	}
 
 	calc_block_sizes();
@@ -1028,11 +1036,11 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 	/* Continue being paranoid... */
 	if (header.bat_offset >
 	    (file_size - footer_size - header.max_bat_ent * sizeof(uint32_t))) {
-		throw std::system_error(make_ec(ErrorCode::Corrupt));
+		return make_ec(ErrorCode::Corrupt);
 	}
 
 	if ((ec = bat_read_table())) {
-		throw std::system_error(ec);
+		return ec;
 	}
 
 	/* Is this too paranoid? */
@@ -1041,14 +1049,15 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 			const auto o = static_cast<uint64_t>(bat[i]) * sector_size;
 			if (o > (file_size - footer_size -
 			         (sb_sector_size + header.block_sz))) {
-				throw std::system_error(make_ec(ErrorCode::Corrupt));
+				return make_ec(ErrorCode::Corrupt);
 			}
 		}
 	}
 
 	/* Done loading a sparse image */
 	if (footer.disk_type == VHDType::Sparse) {
-		return;
+		vhd_is_open = true;
+		return ec;
 	}
 	/* Continue loading parent */
 	for (auto& loc : header.par_loc_entries) {
@@ -1061,7 +1070,7 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 			                        path_buff.size() * sizeof(char16_t),
 			                        static_cast<std::streamoff>(
 			                                loc.plat_data_offset)))) {
-				throw std::system_error(ec);
+				return ec;
 			}
 			/* TODO: Handle path endianess */
 			std::replace(path_buff.begin(), path_buff.end(), u'\\', u'/');
@@ -1070,33 +1079,29 @@ VHD::VHD(fs::path const& vhd_path, bool read_only)
 			                          rel_path;
 			const fs::path par_path = fs::canonical(new_path, ec);
 			if (ec) {
-				throw std::system_error(ec);
+				return ec;
 			}
-			// Not using std::make_unique because of private
-			// constructor
-			parent = std::unique_ptr<VHD>(new VHD(par_path, true));
+			parent = std::make_unique<VHD>();
+			if ((ec = parent->open(par_path, true))) {
+				return ec;
+			}
 			break;
 		}
 	}
 	if (!parent_is_valid()) {
-		throw std::system_error(make_ec(ErrorCode::NoParent));
+		return make_ec(ErrorCode::NoParent);
 	}
 	/* Success! */
-	return;
+	vhd_is_open = true;
+	return ec;
 }
 
-/* Constructor to create a fixed VHD image
-   Called by VHD::create_fixed */
-VHD::VHD(fs::path const& vhd_path, Geom const& geom)
-        : ro(false),
-          footer{},
-          header{},
-          bat{},
-          io(cache_size)
+/* Create a fixed VHD at vhd_path, with geometry geom. */
+std::error_code VHD::create_fixed(fs::path const& vhd_path, Geom const& geom)
 {
 	std::error_code ec;
 	if (vhd_path.empty() || geom.num_sectors() == 0) {
-		throw std::system_error(make_ec(ErrorCode::InvalidArgs));
+		return make_ec(ErrorCode::InvalidArgs);
 	}
 
 	footer.orig_sz   = geom.size_bytes();
@@ -1109,38 +1114,58 @@ VHD::VHD(fs::path const& vhd_path, Geom const& geom)
 	tmp_footer.to_be();
 
 	if ((ec = io.create_file(vhd_path, footer_size))) {
-		throw std::system_error(ec);
+		return ec;
 	}
 
 	if ((ec = io.write_structure(tmp_footer, 0, std::ios_base::end))) {
-		throw std::system_error(ec);
+		return ec;
 	}
+	vhd_is_open = true;
+	return ec;
 }
 
-/* Constructor to create a sparse or differencing VHD
-   Called by VHD::create_sparse and VHD::create_diff */
-VHD::VHD(fs::path const& vhd_path, VHDType const vhd_type, Geom const& geom,
-         BlockSize block_size, fs::path const& par_path)
-        : ro(false),
-          footer{},
-          header{},
-          bat{},
-          io(cache_size)
+/* Create a sparse VHD at vhd_path with geometry geom. If block_size
+   is BlockSize::Large (default) then the image will be created with
+   2MiB block sizes. Otherwise if BlockSize::Small, the blocks will
+   512KiB in size */
+std::error_code VHD::create_sparse(fs::path const& vhd_path, Geom const& geom,
+                                   BlockSize block_size)
+{
+	return create_diff_sparse(vhd_path, VHDType::Sparse, geom, block_size, fs::path{});
+}
+
+/* Create a sparse VHD at vhd_path, which has a parent at par_path.
+   If block_size is BlockSize::Large (default) then the image will
+   be created with 2MiB block sizes. Otherwise if BlockSize::Small,
+   the blocks will 512KiB in size.  */
+std::error_code VHD::create_diff(fs::path const& vhd_path,
+                                 fs::path const& par_path, BlockSize block_size)
+{
+	return create_diff_sparse(vhd_path, VHDType::Diff, Geom{}, block_size, par_path);
+}
+
+/* Perform the actual creation of sparse and differencing images */
+std::error_code VHD::create_diff_sparse(fs::path const& vhd_path,
+                                        VHDType const vhd_type,
+                                        Geom const& geom, BlockSize block_size,
+                                        fs::path const& par_path)
 {
 	std::error_code ec;
 	if (vhd_path.empty() || !is_one_of(vhd_type, VHDType::Sparse, VHDType::Diff)) {
-		throw std::system_error(make_ec(ErrorCode::InvalidArgs));
+		return make_ec(ErrorCode::InvalidArgs);
 	}
 	if (vhd_type == VHDType::Sparse && geom.num_sectors() == 0) {
-		throw std::system_error(make_ec(ErrorCode::InvalidArgs));
+		return make_ec(ErrorCode::InvalidArgs);
 	}
 	if (vhd_type == VHDType::Diff && par_path.empty()) {
-		throw std::system_error(make_ec(ErrorCode::InvalidArgs));
+		return make_ec(ErrorCode::InvalidArgs);
 	}
 
 	if (vhd_type == VHDType::Diff) {
-		// Not using std::make_unique because of private constructor
-		parent = std::unique_ptr<VHD>(new VHD(par_path, true));
+		parent = std::make_unique<VHD>();
+		if ((ec = parent->open(par_path, true))) {
+			return ec;
+		}
 	}
 	if (vhd_type == VHDType::Diff) {
 		footer.orig_sz = parent->footer.orig_sz;
@@ -1190,7 +1215,7 @@ VHD::VHD(fs::path const& vhd_path, VHDType const vhd_type, Geom const& geom,
 		auto vhd_dir  = vhd_path.parent_path();
 		auto rel_path = fs::relative(par_path, vhd_dir, ec);
 		if (ec) {
-			throw std::system_error(ec);
+			return ec;
 		}
 		rel_parent_path = rel_path.generic_u16string();
 		std::replace(rel_parent_path.begin(), rel_parent_path.end(), u'/', u'\\');
@@ -1221,23 +1246,23 @@ VHD::VHD(fs::path const& vhd_path, VHDType const vhd_type, Geom const& geom,
 	tmp_header.to_be();
 
 	if ((ec = io.create_file(vhd_path))) {
-		throw std::system_error(ec);
+		return ec;
 	}
 	if ((ec = io.write_structure(tmp_footer, 0))) {
-		throw std::system_error(ec);
+		return ec;
 	}
 	if ((ec = io.write_structure(tmp_header,
 	                             static_cast<std::streamoff>(footer.data_offset)))) {
-		throw std::system_error(ec);
+		return ec;
 	}
 
 	if ((ec = bat_write_table())) {
-		throw std::system_error(ec);
+		return ec;
 	}
 	if ((ec = write_sector_padding(bat_loc_padding,
 	                               static_cast<std::streamoff>(
 	                                       header.bat_offset + bat_size_bytes())))) {
-		throw std::system_error(ec);
+		return ec;
 	}
 
 	if (vhd_type == VHDType::Diff) {
@@ -1252,12 +1277,14 @@ VHD::VHD(fs::path const& vhd_path, VHDType const vhd_type, Geom const& geom,
 		             par_loc_buff.size() * sizeof(char16_t),
 		             static_cast<std::streamoff>(
 		                     header.par_loc_entries[0].plat_data_offset)))) {
-			throw std::system_error(ec);
+			return ec;
 		}
 	}
 	if ((ec = io.write_structure(tmp_footer, 0, std::ios_base::end))) {
-		throw std::system_error(ec);
+		return ec;
 	}
+	vhd_is_open = true;
+	return ec;
 }
 
 /* Check that a differencing VHD has a valid parent */
@@ -1283,63 +1310,6 @@ uint32_t VHD::calc_sib(uint32_t sector_num)
 	return sector_num % static_cast<uint32_t>(sectors_per_block);
 }
 
-/* Open an existing VHD, at vhd_path. If read_only is set, the image
-   will be open in read_only mode */
-VHD::open_variant VHD::open(fs::path const& vhd_path, bool read_only)
-{
-	try {
-		VHD vhd(vhd_path, read_only);
-		return open_variant(std::move(vhd));
-	} catch (const std::system_error& e) {
-		return open_variant(std::error_code(e.code()));
-	}
-}
-
-/* Create a fixed VHD at vhd_path, with geometry geom. */
-VHD::open_variant VHD::create_fixed(fs::path const& vhd_path, Geom const& geom)
-{
-	return create(vhd_path, geom, BlockSize::Large, fs::path(), VHDType::Fixed);
-}
-
-/* Create a sparse VHD at vhd_path with geometry geom. If block_size
-   is BlockSize::Large (default) then the image will be created with
-   2MiB block sizes. Otherwise if BlockSize::Small, the blocks will
-   512KiB in size */
-VHD::open_variant VHD::create_sparse(fs::path const& vhd_path, Geom const& geom,
-                                     BlockSize block_size)
-{
-	return create(vhd_path, geom, block_size, fs::path(), VHDType::Sparse);
-}
-
-/* Create a sparse VHD at vhd_path, which has a parent at par_path.
-   If block_size is BlockSize::Large (default) then the image will
-   be created with 2MiB block sizes. Otherwise if BlockSize::Small,
-   the blocks will 512KiB in size.  */
-VHD::open_variant VHD::create_diff(fs::path const& vhd_path,
-                                   fs::path const& par_path, BlockSize block_size)
-{
-	return create(vhd_path, Geom(), block_size, par_path, VHDType::Diff);
-}
-
-/* Common function to create VHD images, with exception handling */
-VHD::open_variant VHD::create(fs::path const& vhd_path, Geom const& geom,
-                              BlockSize block_size, fs::path const& par_path,
-                              VHDType vhd_type)
-{
-	try {
-		if (vhd_type == VHDType::Fixed) {
-			return open_variant(VHD(vhd_path, geom));
-		} else if (is_one_of(vhd_type, VHDType::Sparse, VHDType::Diff)) {
-			return open_variant(
-			        VHD(vhd_path, vhd_type, geom, block_size, par_path));
-		} else {
-			return open_variant(make_ec(ErrorCode::InvalidArgs));
-		}
-	} catch (const std::system_error& e) {
-		return open_variant(std::error_code(e.code()));
-	}
-}
-
 /* Read a single sector at sector_num offset from the VHD
    and store the data in the buffer pointed to by dest.
    The buffer MUST be large enough to hold the size of
@@ -1348,6 +1318,9 @@ std::error_code VHD::read_sector(uint32_t const sector_num, void* dest)
 {
 	if (sector_num >= footer.geom.num_sectors()) {
 		return make_ec(ErrorCode::SectorOutOfRange);
+	}
+	if (!vhd_is_open) {
+		return make_ec(ErrorCode::UseBeforeOpen);
 	}
 	std::error_code ec;
 
@@ -1384,6 +1357,9 @@ std::error_code VHD::write_sector(uint32_t const sector_num, const void* src)
 {
 	if (sector_num >= footer.geom.num_sectors()) {
 		return make_ec(ErrorCode::SectorOutOfRange);
+	}
+	if (!vhd_is_open) {
+		return make_ec(ErrorCode::UseBeforeOpen);
 	}
 	if (ro) {
 		return make_ec(ErrorCode::ReadOnly);

@@ -281,9 +281,9 @@ std::string test_data_2_digest = "";
 
 int test_open(std::filesystem::path& path)
 {
-    auto res = MVHDPP::VHD::open(path);
-    if (std::holds_alternative<std::error_code>(res)) {
-        auto ec = std::get<std::error_code>(res);
+    MVHDPP::VHD vhd;
+    auto ec = vhd.open(path);
+    if (ec) {
         std::cout << ec.message() << std::endl;
         return 1;
     }
@@ -292,13 +292,12 @@ int test_open(std::filesystem::path& path)
 
 int test_create_fixed(std::filesystem::path& path, MVHDPP::Geom& geom) 
 {
-    auto res = MVHDPP::VHD::create_fixed(path, geom);
-    if (std::holds_alternative<std::error_code>(res)) {
-        auto ec = std::get<std::error_code>(res);
+    MVHDPP::VHD vhd;
+    auto ec = vhd.create_fixed(path, geom);
+    if (ec) {
         std::cout << ec.message() << std::endl;
         return 1;
     }
-    auto vhd = std::get<MVHDPP::VHD>(std::move(res));
     if (prepare_img(&vhd)) {
         return 4;
     }
@@ -314,13 +313,12 @@ int test_create_fixed(std::filesystem::path& path, MVHDPP::Geom& geom)
 
 int test_create_sparse(std::filesystem::path& path, MVHDPP::Geom& geom)
 {
-    auto res = MVHDPP::VHD::create_sparse(path, geom);
-    if (std::holds_alternative<std::error_code>(res)) {
-        auto ec = std::get<std::error_code>(res);
+    MVHDPP::VHD vhd;
+    auto ec = vhd.create_sparse(path, geom);
+    if (ec) {
         std::cout << ec.message() << std::endl;
         return 1;
     }
-    auto vhd = std::get<MVHDPP::VHD>(std::move(res));
     if (prepare_img(&vhd)) {
         return 4;
     }
@@ -336,13 +334,12 @@ int test_create_sparse(std::filesystem::path& path, MVHDPP::Geom& geom)
 
 int test_create_diff(std::filesystem::path& path, std::filesystem::path& parent)
 {
-    auto res = MVHDPP::VHD::create_diff(path, parent);
-    if (std::holds_alternative<std::error_code>(res)) {
-        auto ec = std::get<std::error_code>(res);
+    MVHDPP::VHD vhd;
+    auto ec = vhd.create_diff(path, parent);
+    if (ec) {
         std::cout << ec.message() << std::endl;
         return 1;
     }
-    auto vhd = std::get<MVHDPP::VHD>(std::move(res));
     test_data_2_digest = create_write_file(&vhd, test_data_2_path);
     if (test_data_2_digest == "") {
         return 2;

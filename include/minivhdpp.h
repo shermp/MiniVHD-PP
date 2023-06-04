@@ -38,6 +38,7 @@ enum class ErrorCode {
 	NoParent,
 	UnsupportedBlockSize,
 	SectorOutOfRange,
+	UseBeforeOpen,
 	ReadOnly,
 };
 
@@ -121,22 +122,22 @@ class VHD {
 	using open_variant = std::variant<VHD, std::error_code>;
 
 public:
+	VHD();
 	/* Allow move but not copy */
 	VHD(const VHD&)            = delete;
 	VHD& operator=(const VHD&) = delete;
 	VHD(VHD&&)                 = default;
 	VHD& operator=(VHD&&)      = default;
 
-	static open_variant open(fs::path const& vhd_path, bool read_only = false);
+	std::error_code open(fs::path const& vhd_path, bool read_only = false);
 
-	static open_variant create_fixed(fs::path const& vhd_path, Geom const& geom);
+	std::error_code create_fixed(fs::path const& vhd_path, Geom const& geom);
 
-	static open_variant create_sparse(fs::path const& vhd_path, Geom const& geom,
-	                                  BlockSize block_size = BlockSize::Large);
+	std::error_code create_sparse(fs::path const& vhd_path, Geom const& geom,
+	                              BlockSize block_size = BlockSize::Large);
 
-	static open_variant create_diff(fs::path const& vhd_path,
-	                                fs::path const& par_path,
-	                                BlockSize block_size = BlockSize::Large);
+	std::error_code create_diff(fs::path const& vhd_path, fs::path const& par_path,
+	                            BlockSize block_size = BlockSize::Large);
 
 	static bool file_is_vhd(std::filebuf& file);
 	static bool file_is_vhd(std::fstream& file);
@@ -148,13 +149,11 @@ public:
 
 private:
 	enum VHDType { Fixed = 2, Sparse = 3, Diff = 4 };
-	static open_variant create(fs::path const& vhd_path, Geom const& geom,
-	                           BlockSize block_size,
-	                           fs::path const& par_path, VHDType vhd_type);
-	VHD(fs::path const& vhd_path, bool read_only);
-	VHD(fs::path const& vhd_path, Geom const& geom);
-	VHD(fs::path const& vhd_path, VHDType const vhd_type, Geom const& geom,
-	    BlockSize block_size, fs::path const& par_path);
+
+	std::error_code create_diff_sparse(fs::path const& vhd_path,
+	                                   VHDType const vhd_type,
+	                                   Geom const& geom, BlockSize block_size,
+	                                   fs::path const& par_path);
 	struct Uuid {
 		std::array<uint8_t, 16> uuid = {0};
 
@@ -226,6 +225,7 @@ private:
 	};
 	static_assert(sizeof(SparseHeader) == sparse_size);
 
+	bool vhd_is_open;
 	bool ro;
 
 	Footer footer;
