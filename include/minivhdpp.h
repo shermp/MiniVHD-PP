@@ -54,68 +54,6 @@ enum class ErrorCode {
 
 enum class BlockSize { Large, Small };
 
-class LRUCache {
-public:
-	LRUCache(std::size_t size);
-
-	bool in_cache(const uint64_t key);
-	uint8_t* get(const uint64_t key);
-	void set(const uint64_t key, const void* val);
-	void clear();
-
-private:
-	struct Node {
-		uint64_t key;
-		uint8_t* val;
-	};
-	std::list<Node> cache_list;
-	std::unordered_map<uint64_t, typename std::list<Node>::iterator> cache_map;
-	std::vector<uint8_t> backing_store;
-	std::size_t cache_size = 0;
-
-	void move_to_front(typename std::list<Node>::iterator it);
-};
-
-class IOManager {
-public:
-	using ios = std::ios_base;
-	IOManager(std::size_t cache_size);
-
-	std::error_code open_file(fs::path path, ios::openmode open_mode);
-	std::error_code create_file(fs::path path, uintmax_t size = 0);
-
-	std::filebuf& file();
-
-	std::error_code read_chunk(void* dest, uint64_t chunk, std::streamoff offset);
-	std::error_code write_chunk(const void* src, uint64_t chunk,
-	                            std::streamoff offset);
-	std::error_code read_bytes(void* dest, uint64_t num_bytes,
-	                           std::streamoff offset,
-	                           ios::seekdir dir = ios::beg);
-	std::error_code write_bytes(const void* src, uint64_t num_bytes,
-	                            std::streamoff offset,
-	                            ios::seekdir dir = ios::beg);
-	template <typename Structure>
-	std::error_code read_structure(Structure& s, std::streamoff offset,
-	                               ios::seekdir dir = ios::beg);
-	template <typename Structure>
-	std::error_code write_structure(Structure const& s, std::streamoff offset,
-	                                ios::seekdir dir = ios::beg);
-	std::streamoff offset_at(std::streamoff rel_offset,
-	                         ios::seekdir dir = ios::beg);
-	int flush();
-	void next_write_preserve_cache();
-
-private:
-	enum class PrevState { Read, Write, Unknown };
-	std::filebuf img;
-	LRUCache chunk_cache;
-
-	std::streamoff curr_offset = 0;
-	PrevState prev_state       = PrevState::Unknown;
-	bool preserve_cache        = false;
-};
-
 struct MVHDPP_API Geom {
 	uint16_t cyl  = 0;
 	uint8_t heads = 0;
@@ -136,8 +74,8 @@ public:
 	/* Allow move but not copy */
 	VHD(const VHD&)            = delete;
 	VHD& operator=(const VHD&) = delete;
-	MVHDPP_API VHD(VHD&&)                 = default;
-	MVHDPP_API VHD& operator=(VHD&&)      = default;
+	VHD(VHD&&)                 = default;
+	VHD& operator=(VHD&&)      = default;
 
 	MVHDPP_API std::error_code open(fs::path const& vhd_path, bool read_only = false);
 
@@ -164,6 +102,69 @@ private:
 	                                   VHDType const vhd_type,
 	                                   Geom const& geom, BlockSize block_size,
 	                                   fs::path const& par_path);
+	
+	class LRUCache {
+	public:
+		LRUCache(std::size_t size);
+
+		bool in_cache(const uint64_t key);
+		uint8_t* get(const uint64_t key);
+		void set(const uint64_t key, const void* val);
+		void clear();
+
+	private:
+		struct Node {
+			uint64_t key;
+			uint8_t* val;
+		};
+		std::list<Node> cache_list;
+		std::unordered_map<uint64_t, typename std::list<Node>::iterator> cache_map;
+		std::vector<uint8_t> backing_store;
+		std::size_t cache_size = 0;
+
+		void move_to_front(typename std::list<Node>::iterator it);
+	};
+
+	class IOManager {
+	public:
+		using ios = std::ios_base;
+		IOManager(std::size_t cache_size);
+
+		std::error_code open_file(fs::path path, ios::openmode open_mode);
+		std::error_code create_file(fs::path path, uintmax_t size = 0);
+
+		std::filebuf& file();
+
+		std::error_code read_chunk(void* dest, uint64_t chunk, std::streamoff offset);
+		std::error_code write_chunk(const void* src, uint64_t chunk,
+									std::streamoff offset);
+		std::error_code read_bytes(void* dest, uint64_t num_bytes,
+								std::streamoff offset,
+								ios::seekdir dir = ios::beg);
+		std::error_code write_bytes(const void* src, uint64_t num_bytes,
+									std::streamoff offset,
+									ios::seekdir dir = ios::beg);
+		template <typename Structure>
+		std::error_code read_structure(Structure& s, std::streamoff offset,
+									ios::seekdir dir = ios::beg);
+		template <typename Structure>
+		std::error_code write_structure(Structure const& s, std::streamoff offset,
+										ios::seekdir dir = ios::beg);
+		std::streamoff offset_at(std::streamoff rel_offset,
+								ios::seekdir dir = ios::beg);
+		int flush();
+		void next_write_preserve_cache();
+
+	private:
+		enum class PrevState { Read, Write, Unknown };
+		std::filebuf img;
+		LRUCache chunk_cache;
+
+		std::streamoff curr_offset = 0;
+		PrevState prev_state       = PrevState::Unknown;
+		bool preserve_cache        = false;
+	};
+	
 	struct Uuid {
 		std::array<uint8_t, 16> uuid = {0};
 

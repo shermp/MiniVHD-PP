@@ -213,7 +213,7 @@ static inline void set_nibble_upper(uint8_t& val, uint8_t nibble)
  * I/O Manager
  *****************************************/
 
-LRUCache::LRUCache(std::size_t size)
+VHD::LRUCache::LRUCache(std::size_t size)
         : cache_list{},
           cache_map{},
           backing_store(size * sector_size),
@@ -221,14 +221,14 @@ LRUCache::LRUCache(std::size_t size)
 {}
 
 /* Test if the given key is in the cache */
-bool LRUCache::in_cache(const uint64_t key)
+bool VHD::LRUCache::in_cache(const uint64_t key)
 {
 	return cache_map.find(key) != cache_map.end();
 }
 
 /* Get the pointer to data at key. You MUST check
    if the key is in the cache first with in_cache() */
-uint8_t* LRUCache::get(const uint64_t key)
+uint8_t* VHD::LRUCache::get(const uint64_t key)
 {
 	auto it = cache_map[key];
 	move_to_front(it);
@@ -236,7 +236,7 @@ uint8_t* LRUCache::get(const uint64_t key)
 }
 
 /* Set a value to the cache, using the supplied key. */
-void LRUCache::set(const uint64_t key, const void* val)
+void VHD::LRUCache::set(const uint64_t key, const void* val)
 {
 	if (in_cache(key)) {
 		move_to_front(cache_map[key]);
@@ -257,14 +257,14 @@ void LRUCache::set(const uint64_t key, const void* val)
 }
 
 /* Clears the cache */
-void LRUCache::clear()
+void VHD::LRUCache::clear()
 {
 	cache_map.clear();
 	cache_list.clear();
 	std::fill(backing_store.begin(), backing_store.end(), static_cast<uint8_t>(0U));
 }
 
-void LRUCache::move_to_front(typename std::list<Node>::iterator it)
+void VHD::LRUCache::move_to_front(typename std::list<Node>::iterator it)
 {
 	cache_list.splice(cache_list.begin(), cache_list, it);
 }
@@ -276,9 +276,9 @@ void LRUCache::move_to_front(typename std::list<Node>::iterator it)
 
    Note that the ChunkKey template parameter MUST be an integral */
 
-IOManager::IOManager(std::size_t cache_sz) : img(), chunk_cache(cache_sz) {}
+VHD::IOManager::IOManager(std::size_t cache_sz) : img(), chunk_cache(cache_sz) {}
 
-std::error_code IOManager::open_file(fs::path path, ios::openmode open_mode)
+std::error_code VHD::IOManager::open_file(fs::path path, ios::openmode open_mode)
 {
 	std::error_code ec;
 
@@ -303,7 +303,7 @@ std::error_code IOManager::open_file(fs::path path, ios::openmode open_mode)
 	return ec;
 }
 
-std::error_code IOManager::create_file(fs::path path, uintmax_t size)
+std::error_code VHD::IOManager::create_file(fs::path path, uintmax_t size)
 {
 	std::error_code ec;
 	if (!img.open(path, create_mode)) {
@@ -324,7 +324,7 @@ std::error_code IOManager::create_file(fs::path path, uintmax_t size)
 	return ec;
 }
 
-std::filebuf& IOManager::file()
+std::filebuf& VHD::IOManager::file()
 {
 	return img;
 }
@@ -335,7 +335,7 @@ std::filebuf& IOManager::file()
         it will be read from the from the file. The chunk will be saved
         to a user supplied buffer. The buffer MUST be large enough
         to store a chunk. */
-std::error_code IOManager::read_chunk(void* dest, uint64_t chunk, std::streamoff offset)
+std::error_code VHD::IOManager::read_chunk(void* dest, uint64_t chunk, std::streamoff offset)
 {
 	std::error_code ec;
 	if (chunk_cache.in_cache(chunk)) {
@@ -355,7 +355,7 @@ std::error_code IOManager::read_chunk(void* dest, uint64_t chunk, std::streamoff
         The chunk will be written from buffer provided at src
         to the file. If the chunk exists in the cache, it will
         be updated, otherwise a new entry will be created. */
-std::error_code IOManager::write_chunk(const void* src, uint64_t chunk,
+std::error_code VHD::IOManager::write_chunk(const void* src, uint64_t chunk,
                                        std::streamoff offset)
 {
 	std::error_code ec;
@@ -369,7 +369,7 @@ std::error_code IOManager::write_chunk(const void* src, uint64_t chunk,
 
 /* Read num_bytes bytes to supplied buffer dest from offset. This reads
         directly from the file, bypassing the chunk cache */
-std::error_code IOManager::read_bytes(void* dest, uint64_t num_bytes,
+std::error_code VHD::IOManager::read_bytes(void* dest, uint64_t num_bytes,
                                       std::streamoff offset, ios::seekdir dir)
 {
 	auto ssize = static_cast<std::streamsize>(num_bytes);
@@ -394,7 +394,7 @@ std::error_code IOManager::read_bytes(void* dest, uint64_t num_bytes,
 /* Write num_bytes bytes from src buffer, to offset. The chunk cache
         will be cleared unless next_write_preserve_cache() is called prior
         to write_bytes() */
-std::error_code IOManager::write_bytes(const void* src, uint64_t num_bytes,
+std::error_code VHD::IOManager::write_bytes(const void* src, uint64_t num_bytes,
                                        std::streamoff offset, ios::seekdir dir)
 {
 	/* Bytes could be written anywhere so cannot guarantee cache
@@ -427,7 +427,7 @@ std::error_code IOManager::write_bytes(const void* src, uint64_t num_bytes,
         The caller is responsible for ensuring the provided structure
         is packed (if required), and for endian handling. */
 template <typename Structure>
-std::error_code IOManager::read_structure(Structure& s, std::streamoff offset,
+std::error_code VHD::IOManager::read_structure(Structure& s, std::streamoff offset,
                                           ios::seekdir dir)
 {
 	constexpr auto size = sizeof(Structure);
@@ -439,7 +439,7 @@ std::error_code IOManager::read_structure(Structure& s, std::streamoff offset,
         The caller is responsible for ensuring the provided structure
         is packed (if required), and for endian handling. */
 template <typename Structure>
-std::error_code IOManager::write_structure(Structure const& s,
+std::error_code VHD::IOManager::write_structure(Structure const& s,
                                            std::streamoff offset, ios::seekdir dir)
 {
 	constexpr auto size = sizeof(Structure);
@@ -447,7 +447,7 @@ std::error_code IOManager::write_structure(Structure const& s,
 	return write_bytes(b, size, offset, dir);
 }
 
-std::streamoff IOManager::offset_at(std::streamoff rel_offset, ios::seekdir dir)
+std::streamoff VHD::IOManager::offset_at(std::streamoff rel_offset, ios::seekdir dir)
 {
 	prev_state  = PrevState::Unknown;
 	curr_offset = std::streamoff(img.pubseekoff(rel_offset, dir));
@@ -455,14 +455,14 @@ std::streamoff IOManager::offset_at(std::streamoff rel_offset, ios::seekdir dir)
 }
 
 /* Flush the file. Use to ensure headers/footers are synced to the file */
-int IOManager::flush()
+int VHD::IOManager::flush()
 {
 	return img.pubsync();
 }
 
 /* By default, write_bytes() clears the chunk cache. This method
         will preserve the cache for the next call to write_bytes() */
-void IOManager::next_write_preserve_cache()
+void VHD::IOManager::next_write_preserve_cache()
 {
 	preserve_cache = true;
 }
