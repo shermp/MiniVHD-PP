@@ -9,7 +9,7 @@
 #include "fatfs/diskio.h"
 #include "amosnier-sha2/sha-256.h"
 
-constexpr int test_file_size = 268959616 / 2;
+constexpr int test_file_size = 64 * 1024 * 1024;
 
 std::array<MVHDPP::VHD*, 10> vhds = {}; 
 
