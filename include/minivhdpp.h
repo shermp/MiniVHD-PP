@@ -13,6 +13,16 @@
 #include <variant>
 #include <vector>
 
+#if defined(_WIN32) && defined(MVHDPP_DLL)
+#if defined(MVHDPP_DLL_EXPORT)
+#define MVHDPP_API __declspec(dllexport)
+#else
+#define MVHDPP_API __declspec(dllimport)
+#endif
+#else
+#define MVHDPP_API
+#endif
+
 namespace MVHDPP {
 
 namespace fs = std::filesystem;
@@ -106,7 +116,7 @@ private:
 	bool preserve_cache        = false;
 };
 
-struct Geom {
+struct MVHDPP_API Geom {
 	uint16_t cyl  = 0;
 	uint8_t heads = 0;
 	uint8_t spt   = 0;
@@ -122,30 +132,30 @@ class VHD {
 	using open_variant = std::variant<VHD, std::error_code>;
 
 public:
-	VHD();
+	MVHDPP_API  VHD();
 	/* Allow move but not copy */
 	VHD(const VHD&)            = delete;
 	VHD& operator=(const VHD&) = delete;
-	VHD(VHD&&)                 = default;
-	VHD& operator=(VHD&&)      = default;
+	MVHDPP_API VHD(VHD&&)                 = default;
+	MVHDPP_API VHD& operator=(VHD&&)      = default;
 
-	std::error_code open(fs::path const& vhd_path, bool read_only = false);
+	MVHDPP_API std::error_code open(fs::path const& vhd_path, bool read_only = false);
 
-	std::error_code create_fixed(fs::path const& vhd_path, Geom const& geom);
+	MVHDPP_API std::error_code create_fixed(fs::path const& vhd_path, Geom const& geom);
 
-	std::error_code create_sparse(fs::path const& vhd_path, Geom const& geom,
+	MVHDPP_API std::error_code create_sparse(fs::path const& vhd_path, Geom const& geom,
 	                              BlockSize block_size = BlockSize::Large);
 
-	std::error_code create_diff(fs::path const& vhd_path, fs::path const& par_path,
+	MVHDPP_API std::error_code create_diff(fs::path const& vhd_path, fs::path const& par_path,
 	                            BlockSize block_size = BlockSize::Large);
 
-	static bool file_is_vhd(std::filebuf& file);
-	static bool file_is_vhd(std::fstream& file);
-	static bool file_is_vhd(FILE* file);
+	MVHDPP_API static bool file_is_vhd(std::filebuf& file);
+	MVHDPP_API static bool file_is_vhd(std::fstream& file);
+	MVHDPP_API static bool file_is_vhd(FILE* file);
 
-	std::error_code read_sector(uint32_t const sector_num, void* dest);
-	std::error_code write_sector(uint32_t const sector_num, const void* src);
-	Geom get_geometry();
+	MVHDPP_API std::error_code read_sector(uint32_t const sector_num, void* dest);
+	MVHDPP_API std::error_code write_sector(uint32_t const sector_num, const void* src);
+	MVHDPP_API Geom get_geometry();
 
 private:
 	enum VHDType { Fixed = 2, Sparse = 3, Diff = 4 };
