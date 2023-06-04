@@ -348,17 +348,20 @@ uint64_t Geom::size_bytes() const
 
 void VHD::Uuid::generate_v4()
 {
-	uint64_t seed = 0;
-	seed = std::random_device {}();
-	uint64_t seed2 = std::random_device {}();
+	uint64_t seed  = 0;
+	seed           = std::random_device{}();
+	uint64_t seed2 = std::random_device{}();
 	/* There is no guarantee that random_device is truly random
 	   Eg: some versions of MinGW have a hardcoded value */
 	if (seed == seed2) {
-		seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+		auto clock = std::chrono::high_resolution_clock::now()
+		                     .time_since_epoch()
+		                     .count();
+		seed = static_cast<uint64_t>(clock);
 	}
 	std::mt19937_64 mt(seed);
 	std::uniform_int_distribution<> dist(0u, 255u);
-	
+
 	/* Generate a v4 (random) UUID */
 	for (auto& b : uuid) {
 		b = static_cast<uint8_t>(dist(mt));
